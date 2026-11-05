@@ -1,0 +1,116 @@
+#!/bin/bash
+set -u
+
+usage() {
+    cat <<'EOF'
+usage: integrityctl [--rundir DIR] <command> [args]
+commands:
+  ping | version | status | list
+  pause | resume
+  rescan [PATH] | deepverify | kill-rescan        (kill-rescan sends SIGUSR1)
+  add PATH | remove PATH | rebaseline [PATH]
+  reload | tail [N] | shutdown
+EOF
+}
+
+RUNDIR=${INTEGRITYD_RUNDIR:-}
+while [ $# -gt 0 ]; do
+    case $1 in
+        --rundir) RUNDIR=${2:?--rundir needs a directory}; shift 2 ;;
+        --rundir=*) RUNDIR=${1#--rundir=}; shift ;;
+        -h | --help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) usage >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+if [ -z "$RUNDIR" ]; then
+    if [ "$(id -u)" -eq 0 ]; then RUNDIR=/var/lib/integrityd; else RUNDIR=$HOME/.integrityd; fi
+fi
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+FIFO=$RUNDIR/control.fifo
+PIDFILE=$RUNDIR/integrityd.pid
+
+escape() {
+    local LC_ALL=C s=$1 out='' c i code
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        printf -v code '%d' "'$c"
+        if [ "$c" = '%' ] || [ "$c" = ' ' ] || { [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; } || [ "$code" -eq 127 ]; then
+            printf -v c '%%%02X' "$((code & 255))"
+        fi
+        out+=$c
+    done
+    printf '%s' "$out"
+}
+
+abspath() {
+    case $1 in
+        /*) printf '%s' "$1" ;;
+        *) printf '%s/%s' "$PWD" "$1" ;;
+    esac
+}
+
+sub=$1
+shift
+case $sub in
+    ping | version | status | list | pause | resume | deepverify | reload | shutdown)
+        [ $# -eq 0 ] || { usage >&2; exit 2; }
+        cmd=$(printf '%s' "$sub" | tr '[:lower:]' '[:upper:]') ;;
+    rescan | rebaseline)
+        cmd=$(printf '%s' "$sub" | tr '[:lower:]' '[:upper:]')
+        [ $# -le 1 ] || { usage >&2; exit 2; }
+        [ $# -eq 1 ] && cmd="$cmd $(escape "$(abspath "$1")")" ;;
+    add | remove)
+        [ $# -eq 1 ] || { usage >&2; exit 2; }
+        cmd="$(printf '%s' "$sub" | tr '[:lower:]' '[:upper:]') $(escape "$(abspath "$1")")" ;;
+    tail)
+        cmd="TAIL ${1:-20}" ;;
+    kill-rescan)
+        pid=$(cat "$PIDFILE" 2>/dev/null) || { echo "integrityctl: no pid file in $RUNDIR" >&2; exit 1; }
+        kill -USR1 "$pid" || exit 1
+        echo "OK sent SIGUSR1 to $pid"
+        exit 0 ;;
+    raw)
+        cmd="$*" ;;
+    *)
+        usage >&2
+        exit 2 ;;
+esac
+
+if [ ! -p "$FIFO" ]; then
+    echo "integrityctl: no reply (daemon not running?)" >&2
+    exit 1
+fi
+reply=$RUNDIR/reply/$$.$RANDOM
+cleanup() { rm -f "$reply"; }
+trap cleanup EXIT INT TERM
+mkfifo -m 600 "$reply" || exit 1
+exec 3<>"$reply"
+
+req="$$-$RANDOM $(escape "$reply") $cmd"
+if [ ${#req} -ge 4096 ]; then
+    echo "integrityctl: request too long" >&2
+    exit 2
+fi
+exec 4<>"$FIFO"
+printf '%s\n' "$req" >&4
+exec 4>&-
+
+rc=1
+line=''
+while read -t 3 -r -u 3 line; do
+    if [ "$line" = "." ]; then
+        [ $rc -eq 1 ] && rc=0
+        break
+    fi
+    case $line in
+        ERR*) rc=2 ;;
+    esac
+    printf '%s\n' "$line"
+done
+if [ "$line" != "." ]; then
+    echo "integrityctl: no reply (daemon not running?)" >&2
+    exit 1
+fi
+exit $rc
